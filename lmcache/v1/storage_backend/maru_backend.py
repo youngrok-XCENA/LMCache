@@ -15,6 +15,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
+from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -61,6 +62,9 @@ class MaruBackend(AllocatorBackendInterface):
         # 1. Config
         self.config = config
         self.loop = loop
+        self._operation_timeout: float = float(
+            (config.extra_config or {}).get("maru_operation_timeout", 10.0)
+        )
 
         self._full_chunk_size_bytes: int = get_size_bytes(
             metadata.get_shapes(), metadata.get_dtypes()
@@ -86,11 +90,21 @@ class MaruBackend(AllocatorBackendInterface):
         self.memory_allocator = self.initialize_allocator(config, metadata)
 
         # 4. State
+        self._connected: bool = True
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
 
+        # 5. Metrics
+        self._rpc_errors: int = 0
+        self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+
     def __str__(self) -> str:
         return self.__class__.__name__
+
+    @property
+    def rpc_errors(self) -> int:
+        """Number of RPC errors since startup."""
+        return self._rpc_errors
 
     @staticmethod
     def _parse_pool_size(raw: Optional[str]) -> int:
@@ -156,6 +170,24 @@ class MaruBackend(AllocatorBackendInterface):
             raise RuntimeError(f"Failed to connect MaruHandler to {config.maru_path}")
         logger.debug("[Maru] Connected to %s", config.maru_path)
         return handler
+
+    def _ensure_connected(self) -> bool:
+        """Ensure the handler is connected, reconnecting if necessary.
+
+        Returns:
+            True if connected.
+        """
+        if self._connected:
+            return True
+        try:
+            logger.info("[Maru] attempting reconnection to %s", self.config.maru_path)
+            self._handler = self._create_handler(self.config)
+            self._connected = True
+            logger.info("[Maru] reconnected successfully")
+            return True
+        except Exception as e:
+            logger.error("[Maru] reconnection failed: %s", e)
+            return False
 
     # =========================================================================
     # AllocatorBackendInterface
@@ -343,7 +375,10 @@ class MaruBackend(AllocatorBackendInterface):
             handle = allocator.create_store_handle(memory_obj)
             key_str = key.to_string()
 
-            await asyncio.to_thread(self._handler.store, key_str, handle)
+            await asyncio.wait_for(
+                asyncio.to_thread(self._handler.store, key_str, handle),
+                timeout=self._operation_timeout,
+            )
             success = True
 
             logger.debug(
@@ -354,6 +389,8 @@ class MaruBackend(AllocatorBackendInterface):
             )
 
         except Exception as e:
+            self._rpc_errors += 1
+            self._connected = False
             logger.error("[Maru] store failed key=%s: %s", key, e)
         finally:
             with self.put_lock:
@@ -384,6 +421,9 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             MemoryObj backed by CXL memory, or None if not found.
         """
+        if not self._ensure_connected():
+            return None
+
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
 
@@ -433,8 +473,9 @@ class MaruBackend(AllocatorBackendInterface):
     ) -> int:
         """Check how many prefix keys exist on MaruServer.
 
-        Prefix-based: returns the count of contiguous keys starting
-        from index 0 that exist. Stops at first miss.
+        Uses batch_exists for a single RPC call. Prefix-based: returns
+        the count of contiguous keys starting from index 0 that exist.
+        Stops at first miss.
 
         Args:
             lookup_id: Unique request identifier.
@@ -444,16 +485,34 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             Number of prefix-contiguous keys that exist.
         """
+        if not keys:
+            return 0
 
         def _contains_prefix() -> int:
-            num_hit = 0
-            for key in keys:
-                if not self.contains(key):
+            if self._mla_worker_id_as0_mode:
+                key_strs = [k.with_new_worker_id(0).to_string() for k in keys]
+            else:
+                key_strs = [k.to_string() for k in keys]
+            results = self._handler.batch_exists(key_strs)
+            count = 0
+            for exists in results:
+                if not exists:
                     break
-                num_hit += 1
-            return num_hit
+                count += 1
+            return count
 
-        return await asyncio.to_thread(_contains_prefix)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_contains_prefix),
+                timeout=self._operation_timeout,
+            )
+        except asyncio.TimeoutError:
+            self._rpc_errors += 1
+            logger.warning(
+                "[Maru] batched_async_contains timed out for lookup_id=%s",
+                lookup_id,
+            )
+            return 0
 
     async def batched_get_non_blocking(
         self,
@@ -463,9 +522,8 @@ class MaruBackend(AllocatorBackendInterface):
     ) -> list[MemoryObj]:
         """Non-blocking batched get via CXL direct read.
 
-        Each key triggers a metadata lookup on MaruServer followed by
-        a zero-copy CXL memory read. Stops at first miss and returns
-        the prefix that was successfully retrieved.
+        Uses batch_retrieve for a single RPC call. Stops at first miss
+        and returns the prefix that was successfully retrieved.
 
         Args:
             lookup_id: Unique request identifier.
@@ -475,17 +533,49 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             List of MemoryObjs backed by CXL memory.
         """
+        if not keys:
+            return []
 
         def _get_batch() -> list[MemoryObj]:
+            if self._mla_worker_id_as0_mode:
+                key_strs = [k.with_new_worker_id(0).to_string() for k in keys]
+            else:
+                key_strs = [k.to_string() for k in keys]
+
+            raw_results = self._handler.batch_retrieve(key_strs)
+
+            allocator = self.memory_allocator
+            assert isinstance(allocator, CxlMemoryAdapter)
+
             results: list[MemoryObj] = []
-            for key in keys:
-                mem_obj = self.get_blocking(key)
-                if mem_obj is None:
+            for mem_info in raw_results:
+                if mem_info is None:
                     break
-                results.append(mem_obj)
+                memory_obj = allocator.get_by_location(
+                    region_id=mem_info.region_id,
+                    page_index=mem_info.page_index,
+                    actual_size=len(mem_info.view),
+                    single_token_size=self._single_token_size,
+                )
+                if memory_obj is None:
+                    break
+                memory_obj.ref_count_up()
+                memory_obj.pin()
+                results.append(memory_obj)
             return results
 
-        return await asyncio.to_thread(_get_batch)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_get_batch),
+                timeout=self._operation_timeout,
+            )
+        except asyncio.TimeoutError:
+            self._rpc_errors += 1
+            logger.warning(
+                "[Maru] batched_get_non_blocking timed out for lookup_id=%s",
+                lookup_id,
+            )
+            return []
 
     # =========================================================================
     # Contains / Pin / Unpin / Remove
@@ -501,6 +591,9 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if key exists.
         """
+        if not self._ensure_connected():
+            return False
+
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
 
@@ -509,8 +602,8 @@ class MaruBackend(AllocatorBackendInterface):
     def pin(self, key: CacheEngineKey) -> bool:
         """Pin a key to prevent eviction.
 
-        TODO: Delegate to MaruHandler.pin() once server-side
-        ref_count management is implemented.
+        Attempts to delegate to MaruHandler if the method is available,
+        otherwise returns False.
 
         Args:
             key: The cache key.
@@ -518,13 +611,20 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if pinned successfully.
         """
+        if hasattr(self._handler, 'pin'):
+            try:
+                return self._handler.pin(key.to_string())
+            except Exception as e:
+                logger.debug("[Maru] pin failed for key=%s: %s", key, e)
+                return False
+        logger.debug("[Maru] pin not supported by handler")
         return False
 
     def unpin(self, key: CacheEngineKey) -> bool:
         """Unpin a key to allow eviction.
 
-        TODO: Delegate to MaruHandler.unpin() once server-side
-        ref_count management is implemented.
+        Attempts to delegate to MaruHandler if the method is available,
+        otherwise returns False.
 
         Args:
             key: The cache key.
@@ -532,6 +632,13 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if unpinned successfully.
         """
+        if hasattr(self._handler, 'unpin'):
+            try:
+                return self._handler.unpin(key.to_string())
+            except Exception as e:
+                logger.debug("[Maru] unpin failed for key=%s: %s", key, e)
+                return False
+        logger.debug("[Maru] unpin not supported by handler")
         return False
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
@@ -544,10 +651,45 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if removed successfully.
         """
+        if not self._ensure_connected():
+            return False
+
         key_str = key.to_string()
         result = self._handler.delete(key_str)
         logger.debug("[Maru] remove key=%s success=%s", key, result)
         return result
+
+    # =========================================================================
+    # Health check
+    # =========================================================================
+
+    async def healthcheck(self) -> bool:
+        """Check if MaruServer is reachable.
+
+        Returns:
+            True if the server responds to health check.
+        """
+        try:
+            healthy = await asyncio.wait_for(
+                asyncio.to_thread(self._handler.healthcheck),
+                timeout=self._operation_timeout,
+            )
+            if not healthy:
+                self._stats_monitor.update_remote_ping_error_code(2)
+                logger.warning("[Maru] healthcheck failed")
+            else:
+                self._stats_monitor.update_remote_ping_error_code(0)
+            return healthy
+        except asyncio.TimeoutError:
+            self._rpc_errors += 1
+            self._stats_monitor.update_remote_ping_error_code(2)
+            logger.warning("[Maru] healthcheck timed out")
+            return False
+        except Exception as e:
+            self._rpc_errors += 1
+            self._stats_monitor.update_remote_ping_error_code(2)
+            logger.warning("[Maru] healthcheck error: %s", e)
+            return False
 
     # =========================================================================
     # Lifecycle
@@ -564,4 +706,5 @@ class MaruBackend(AllocatorBackendInterface):
             )
         self.memory_allocator.close()
         self._handler.close()
+        self._connected = False
         logger.info("MaruBackend closed.")
