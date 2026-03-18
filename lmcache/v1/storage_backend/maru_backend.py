@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import concurrent.futures
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
@@ -90,11 +91,13 @@ class MaruBackend(AllocatorBackendInterface):
         self.memory_allocator = self.initialize_allocator(config, metadata)
 
         # 4. State
+        self._conn_lock = threading.Lock()
         self._connected: bool = True
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
 
         # 5. Metrics
+        self._rpc_error_lock = threading.Lock()
         self._rpc_errors: int = 0
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -105,6 +108,11 @@ class MaruBackend(AllocatorBackendInterface):
     def rpc_errors(self) -> int:
         """Number of RPC errors since startup."""
         return self._rpc_errors
+
+    def _incr_rpc_errors(self) -> None:
+        """Thread-safe increment of the RPC error counter."""
+        with self._rpc_error_lock:
+            self._rpc_errors += 1
 
     @staticmethod
     def _parse_pool_size(raw: Optional[str]) -> int:
@@ -174,20 +182,52 @@ class MaruBackend(AllocatorBackendInterface):
     def _ensure_connected(self) -> bool:
         """Ensure the handler is connected, reconnecting if necessary.
 
+        Thread-safe: uses _conn_lock to prevent concurrent reconnection.
+
         Returns:
             True if connected.
         """
         if self._connected:
             return True
-        try:
-            logger.info("[Maru] attempting reconnection to %s", self.config.maru_path)
-            self._handler = self._create_handler(self.config)
-            self._connected = True
-            logger.info("[Maru] reconnected successfully")
-            return True
-        except Exception as e:
-            logger.error("[Maru] reconnection failed: %s", e)
-            return False
+        with self._conn_lock:
+            # Double-check after acquiring lock
+            if self._connected:
+                return True
+            try:
+                logger.info(
+                    "[Maru] attempting reconnection to %s", self.config.maru_path
+                )
+                self._handler = self._create_handler(self.config)
+                self._connected = True
+                logger.info("[Maru] reconnected successfully")
+                return True
+            except Exception as e:
+                logger.error("[Maru] reconnection failed: %s", e)
+                return False
+
+    def _rpc_with_timeout(self, fn: Callable, *args: Any) -> Any:
+        """Execute a synchronous RPC call with a thread-based timeout.
+
+        Args:
+            fn: The handler method to call.
+            *args: Arguments to pass to fn.
+
+        Returns:
+            The result of fn(*args), or None on timeout/error.
+        """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                future = pool.submit(fn, *args)
+                return future.result(timeout=self._operation_timeout)
+            except concurrent.futures.TimeoutError:
+                self._incr_rpc_errors()
+                logger.warning("[Maru] sync RPC timed out: %s", fn.__name__)
+                return None
+            except Exception as e:
+                self._incr_rpc_errors()
+                self._connected = False
+                logger.error("[Maru] sync RPC failed (%s): %s", fn.__name__, e)
+                return None
 
     # =========================================================================
     # AllocatorBackendInterface
@@ -333,7 +373,7 @@ class MaruBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Union[List[Future], None]:
-        """Submit batched put tasks.
+        """Submit batched put tasks using a single batch_store RPC.
 
         Args:
             keys: The cache keys.
@@ -342,15 +382,20 @@ class MaruBackend(AllocatorBackendInterface):
             on_complete_callback: Optional per-key callback.
 
         Returns:
-            List of Futures, one per key.
+            List of Futures, one per key (all backed by the same batch RPC).
         """
-        futures = []
-        for key, memory_obj in zip(keys, memory_objs, strict=True):
-            future = self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
-            futures.append(future)
-        return futures
+        with self.put_lock:
+            for key in keys:
+                self.put_tasks.add(key)
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._async_batch_store(
+                list(keys), memory_objs, on_complete_callback
+            ),
+            self.loop,
+        )
+        # Return one future per key for interface compatibility
+        return [future] * len(keys)
 
     async def _async_store(
         self,
@@ -389,7 +434,7 @@ class MaruBackend(AllocatorBackendInterface):
             )
 
         except Exception as e:
-            self._rpc_errors += 1
+            self._incr_rpc_errors()
             self._connected = False
             logger.error("[Maru] store failed key=%s: %s", key, e)
         finally:
@@ -401,6 +446,59 @@ class MaruBackend(AllocatorBackendInterface):
                     on_complete_callback(key)
                 except Exception as e:
                     logger.warning("on_complete_callback failed for key %s: %s", key, e)
+
+    async def _async_batch_store(
+        self,
+        keys: List[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        """Register multiple KV metadata entries via a single batch_store RPC.
+
+        Args:
+            keys: The cache keys.
+            memory_objs: MemoryObjs backed by CXL memory.
+            on_complete_callback: Optional per-key callback after registration.
+        """
+        succeeded_keys: list[CacheEngineKey] = []
+        try:
+            allocator = self.memory_allocator
+            assert isinstance(allocator, CxlMemoryAdapter)
+            handles = [allocator.create_store_handle(obj) for obj in memory_objs]
+            key_strs = [k.to_string() for k in keys]
+
+            results = await asyncio.wait_for(
+                asyncio.to_thread(self._handler.batch_store, key_strs, handles),
+                timeout=self._operation_timeout,
+            )
+
+            for key, ok in zip(keys, results):
+                if ok:
+                    succeeded_keys.append(key)
+                else:
+                    logger.warning("[Maru] batch_store partial fail key=%s", key)
+
+            logger.debug(
+                "[Maru] batch_store %d/%d keys", len(succeeded_keys), len(keys)
+            )
+
+        except Exception as e:
+            self._incr_rpc_errors()
+            self._connected = False
+            logger.error("[Maru] batch_store failed: %s", e)
+        finally:
+            with self.put_lock:
+                for key in keys:
+                    self.put_tasks.discard(key)
+
+            if on_complete_callback is not None:
+                for key in succeeded_keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s", key, e
+                        )
 
     # =========================================================================
     # Get (sync)
@@ -428,7 +526,7 @@ class MaruBackend(AllocatorBackendInterface):
             key = key.with_new_worker_id(0)
 
         key_str = key.to_string()
-        mem_info = self._handler.retrieve(key_str)
+        mem_info = self._rpc_with_timeout(self._handler.retrieve, key_str)
         if mem_info is None:
             logger.debug("[Maru] get_blocking miss key=%s", key)
             return None
@@ -507,7 +605,7 @@ class MaruBackend(AllocatorBackendInterface):
                 timeout=self._operation_timeout,
             )
         except asyncio.TimeoutError:
-            self._rpc_errors += 1
+            self._incr_rpc_errors()
             logger.warning(
                 "[Maru] batched_async_contains timed out for lookup_id=%s",
                 lookup_id,
@@ -570,7 +668,7 @@ class MaruBackend(AllocatorBackendInterface):
                 timeout=self._operation_timeout,
             )
         except asyncio.TimeoutError:
-            self._rpc_errors += 1
+            self._incr_rpc_errors()
             logger.warning(
                 "[Maru] batched_get_non_blocking timed out for lookup_id=%s",
                 lookup_id,
@@ -597,7 +695,8 @@ class MaruBackend(AllocatorBackendInterface):
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
 
-        return self._handler.exists(key.to_string())
+        result = self._rpc_with_timeout(self._handler.exists, key.to_string())
+        return bool(result)
 
     def pin(self, key: CacheEngineKey) -> bool:
         """Pin a key to prevent eviction.
@@ -655,7 +754,9 @@ class MaruBackend(AllocatorBackendInterface):
             return False
 
         key_str = key.to_string()
-        result = self._handler.delete(key_str)
+        result = self._rpc_with_timeout(self._handler.delete, key_str)
+        if result is None:
+            return False
         logger.debug("[Maru] remove key=%s success=%s", key, result)
         return result
 
@@ -681,12 +782,12 @@ class MaruBackend(AllocatorBackendInterface):
                 self._stats_monitor.update_remote_ping_error_code(0)
             return healthy
         except asyncio.TimeoutError:
-            self._rpc_errors += 1
+            self._incr_rpc_errors()
             self._stats_monitor.update_remote_ping_error_code(2)
             logger.warning("[Maru] healthcheck timed out")
             return False
         except Exception as e:
-            self._rpc_errors += 1
+            self._incr_rpc_errors()
             self._stats_monitor.update_remote_ping_error_code(2)
             logger.warning("[Maru] healthcheck error: %s", e)
             return False
